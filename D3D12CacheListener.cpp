@@ -109,6 +109,9 @@ void ParseManifestPayload(PEVENT_RECORD pEvent) {
         else if (propName == L"NumDynamicCacheStores") stats.NumDynamicCacheStores = value;
     }
 
+    if (stats.NumRequiredLookups == 0)
+        return;
+
     DWORD pid = pEvent->EventHeader.ProcessId;
     int idx = -1;
     if (pEvent->EventHeader.EventDescriptor.Id == 161) idx = 0;
