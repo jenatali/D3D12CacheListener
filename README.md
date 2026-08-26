@@ -24,25 +24,25 @@ identity check actually reasons about, marking each failure inline:
 ```
   --- ASDInit diagnostics (schemaVersion 3) ---
 
-  Application match      D3D sees now              PSDB was built for
-    Name               : "Foo"                     "foo"                     <-- mismatch (differs only by case)
-    Engine             : "Bar"                     "Baz"                     <-- mismatch
-    Version            : 1.0.0.0                   1.0.0.0
-    Engine version     : 2.0.0.0                   2.0.0.0
-    Executable         : "foo.exe"                 "foo.exe"
+  Application match    D3D sees now                        PSDB was built for
+    Name             : "Contoso Racer"                     "contoso racer"  <-- mismatch (differs only by case)
+    Engine           : "Unreal Engine"                     "UnrealEngine"   <-- mismatch
+    Version          : 1.0.0.0                             1.0.0.0
+    Engine version   : 5.3.0.0                             5.3.0.0
+    Executable       : "C:\Games\Contoso\bin\contoso.exe"  "contoso.exe"
 
-  ABI compatibility      driver                    PSDB compiler
-    Adapter family     : "NVIDIA_Turing"           "NVIDIA_Ampere"           <-- mismatch
-    Compiler version   : 1.2.3.4                   1.2.0.0
-    ABI version        : [3.0.0.0, 5.0.0.0]        7.0.0.0                   <-- out of range
+  ABI compatibility    driver                              PSDB compiler
+    Adapter family   : "NVIDIA_Ada"                        "NVIDIA_Ampere"  <-- mismatch
+    Compiler version : 1.2.3.4                             1.2.0.0
+    ABI version      : [3.0.0.0, 5.0.0.0]                  7.0.0.0          <-- out of range
 
   Application profile
-    Driver expects     : 2.1.0.0
-    PSDB resolved      : 3.0.0.0                   <-- major version mismatch
+    Driver expects   : 2.1.0.0
+    PSDB resolved    : 3.0.0.0                             <-- major version mismatch
 
   Sources
-    Application desc   : SetApplicationIdentity (2)
-    Default PSDB       : ShaderCacheRegistration (3)
+    Application desc : SetApplicationIdentity (2)
+    Default PSDB     : ShaderCacheRegistration (3)
 ```
 
 - **Application match** compares what D3D understands the running application to be (from API calls
@@ -56,6 +56,7 @@ identity check actually reasons about, marking each failure inline:
   are only present at schema version 3 and later.
 
 Version fields are four packed 16-bit components and are printed in `a.b.c.d` notation. The
-application profile version is compared on its leading two components only. If none of the checks
-fires, the tool says so explicitly — that means the runtime enforced a check this tool does not yet
-model.
+application profile version is compared on its leading two components only. Columns are sized to
+fit their content, and values too long for a column — full executable paths, most often — wrap onto
+a continuation line. If none of the checks fires, the tool says so explicitly — that means the
+runtime enforced a check this tool does not yet model.

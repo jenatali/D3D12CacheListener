@@ -439,51 +439,108 @@ static bool EqualsIgnoringCase(const std::wstring& a, const std::wstring& b) {
     return true;
 }
 
-// Column geometry for the two-column comparison layout.
-static const size_t kLabelWidth = 19;
-static const size_t kValueWidth = 26;
+// One row of the diagnostics table. An empty right value makes the row single-column; a non-empty
+// note appends an inline mismatch marker.
+struct DiagRow {
+    std::string label;
+    std::string left;
+    std::string right;
+    std::string note;
+};
+
+// A titled group of rows. Empty column headers make the whole section single-column.
+struct DiagSection {
+    std::string title;
+    std::string leftHeader;
+    std::string rightHeader;
+    std::vector<DiagRow> rows;
+};
 
 static std::string PadTo(const std::string& s, size_t width) {
-    if (s.size() >= width) return s + " ";
+    if (s.size() >= width) return s;
     return s + std::string(width - s.size(), ' ');
 }
 
-static void DumpSectionHeader(std::ostringstream& ss, const char* title,
-                              const char* leftHeader, const char* rightHeader) {
-    ss << "  " << PadTo(title, kLabelWidth + 4) << PadTo(leftHeader, kValueWidth)
-       << rightHeader << "\n";
+static void Widen(size_t& width, size_t candidate) {
+    if (candidate > width) width = candidate;
 }
 
-// Emits one row. Pass an empty right value for single-column rows; mismatchNote is appended as
-// an inline marker so the failure is called out where the values actually disagree.
-static void DumpRow(std::ostringstream& ss, const char* label, const std::string& left,
-                    const std::string& right = std::string(),
-                    const char* mismatchNote = nullptr) {
-    ss << "    " << PadTo(label, kLabelWidth) << ": ";
-    if (right.empty() && !mismatchNote) {
-        ss << left << "\n";
-        return;
+// Columns are sized to their widest content across every section, so real-world values -- full
+// executable paths, long adapter family names -- stay aligned instead of pushing later columns out
+// of position on whichever row happens to be longest. Widths are capped so that a single very long
+// path can't stretch the whole table past a readable console width; values over the cap wrap onto a
+// continuation line instead.
+static const size_t kMaxColumnWidth = 60;
+
+static void RenderSections(std::ostringstream& ss, const std::vector<DiagSection>& sections) {
+    const size_t gap = 2;
+    size_t labelWidth = 0;
+    size_t leftWidth = 0;
+    size_t rightWidth = 0;
+
+    for (const DiagSection& section : sections) {
+        // A section title occupies the label column plus the ": " separator.
+        if (section.title.size() > 2) Widen(labelWidth, section.title.size() - 2);
+        Widen(leftWidth, section.leftHeader.size());
+        for (const DiagRow& row : section.rows) {
+            Widen(labelWidth, row.label.size());
+            // Only values with something after them need to be padded to a column width.
+            if (!row.right.empty() || !row.note.empty()) Widen(leftWidth, row.left.size());
+            if (!row.note.empty()) Widen(rightWidth, row.right.size());
+        }
     }
-    if (right.empty()) {
-        ss << PadTo(left, kValueWidth) << "<-- " << mismatchNote << "\n";
-        return;
-    }
-    ss << PadTo(left, kValueWidth);
-    if (mismatchNote) {
-        ss << PadTo(right, kValueWidth) << "<-- " << mismatchNote << "\n";
-    } else {
-        ss << right << "\n";
+    if (leftWidth > kMaxColumnWidth) leftWidth = kMaxColumnWidth;
+    if (rightWidth > kMaxColumnWidth) rightWidth = kMaxColumnWidth;
+    leftWidth += gap;
+    rightWidth += gap;
+
+    const std::string continuation(4 + labelWidth + 2, ' ');
+
+    for (size_t i = 0; i < sections.size(); ++i) {
+        const DiagSection& section = sections[i];
+        if (i != 0) ss << "\n";
+
+        if (section.leftHeader.empty()) {
+            ss << "  " << section.title << "\n";
+        } else {
+            ss << "  " << PadTo(section.title, labelWidth + 4) << PadTo(section.leftHeader, leftWidth)
+               << section.rightHeader << "\n";
+        }
+
+        for (const DiagRow& row : section.rows) {
+            ss << "    " << PadTo(row.label, labelWidth) << ": ";
+            if (row.right.empty() && row.note.empty()) {
+                ss << row.left << "\n";
+                continue;
+            }
+
+            if (row.left.size() > leftWidth - gap) {
+                ss << row.left << "\n" << continuation;
+            } else {
+                ss << PadTo(row.left, leftWidth);
+            }
+
+            if (row.note.empty()) {
+                ss << row.right << "\n";
+            } else if (row.right.empty()) {
+                ss << "<-- " << row.note << "\n";
+            } else if (row.right.size() > rightWidth - gap) {
+                ss << row.right << "\n" << continuation << "<-- " << row.note << "\n";
+            } else {
+                ss << PadTo(row.right, rightWidth) << "<-- " << row.note << "\n";
+            }
+        }
     }
 }
 
-// Returns the inline marker text for a mismatched string pair, or nullptr when the two agree
-// (or either is absent). Differing only by case is a common and easily-missed registration bug,
-// so it gets its own wording.
-static const char* StringMismatchNote(const TraceLoggingPayload& payload, const wchar_t* keyA,
+// Returns the inline marker text for a mismatched string pair, or an empty string when the two
+// agree (or either is absent). Differing only by case is a common and easily-missed registration
+// bug, so it gets its own wording.
+static std::string StringMismatchNote(const TraceLoggingPayload& payload, const wchar_t* keyA,
                                       const wchar_t* keyB, bool& anyMismatch) {
     auto a = payload.GetString(keyA);
     auto b = payload.GetString(keyB);
-    if (!a || !b || *a == *b) return nullptr;
+    if (!a || !b || *a == *b) return std::string();
     anyMismatch = true;
     return EqualsIgnoringCase(*a, *b) ? "mismatch (differs only by case)" : "mismatch";
 }
@@ -500,37 +557,42 @@ bool DumpAsdInitPayload(std::ostringstream& ss, const TraceLoggingPayload& paylo
     if (schemaVersion) ss << *schemaVersion; else ss << "unknown";
     ss << ") ---\n\n";
 
-    DumpSectionHeader(ss, "Application match", "D3D sees now", "PSDB was built for");
-    DumpRow(ss, "Name",
-            FormatStringField(payload, L"ApplicationDesc.Name"),
-            FormatStringField(payload, L"ApplicationIdentity.ApplicationName"),
-            StringMismatchNote(payload, L"ApplicationDesc.Name",
-                               L"ApplicationIdentity.ApplicationName", anyMismatch));
-    DumpRow(ss, "Engine",
-            FormatStringField(payload, L"ApplicationDesc.EngineName"),
-            FormatStringField(payload, L"ApplicationIdentity.EngineName"),
-            StringMismatchNote(payload, L"ApplicationDesc.EngineName",
-                               L"ApplicationIdentity.EngineName", anyMismatch));
-    DumpRow(ss, "Version",
-            FormatVersionField(payload, L"ApplicationDesc.Version"),
-            FormatVersionField(payload, L"ApplicationIdentity.ApplicationVersion"));
-    DumpRow(ss, "Engine version",
-            FormatVersionField(payload, L"ApplicationDesc.EngineVersion"),
-            FormatVersionField(payload, L"ApplicationIdentity.EngineVersion"));
-    DumpRow(ss, "Executable",
-            FormatStringField(payload, L"ApplicationDesc.ExeFilename"),
-            FormatStringField(payload, L"ApplicationIdentity.ExeFilename"));
+    DiagSection appMatch;
+    appMatch.title = "Application match";
+    appMatch.leftHeader = "D3D sees now";
+    appMatch.rightHeader = "PSDB was built for";
+    appMatch.rows.push_back({ "Name",
+        FormatStringField(payload, L"ApplicationDesc.Name"),
+        FormatStringField(payload, L"ApplicationIdentity.ApplicationName"),
+        StringMismatchNote(payload, L"ApplicationDesc.Name",
+                           L"ApplicationIdentity.ApplicationName", anyMismatch) });
+    appMatch.rows.push_back({ "Engine",
+        FormatStringField(payload, L"ApplicationDesc.EngineName"),
+        FormatStringField(payload, L"ApplicationIdentity.EngineName"),
+        StringMismatchNote(payload, L"ApplicationDesc.EngineName",
+                           L"ApplicationIdentity.EngineName", anyMismatch) });
+    appMatch.rows.push_back({ "Version",
+        FormatVersionField(payload, L"ApplicationDesc.Version"),
+        FormatVersionField(payload, L"ApplicationIdentity.ApplicationVersion"), "" });
+    appMatch.rows.push_back({ "Engine version",
+        FormatVersionField(payload, L"ApplicationDesc.EngineVersion"),
+        FormatVersionField(payload, L"ApplicationIdentity.EngineVersion"), "" });
+    appMatch.rows.push_back({ "Executable",
+        FormatStringField(payload, L"ApplicationDesc.ExeFilename"),
+        FormatStringField(payload, L"ApplicationIdentity.ExeFilename"), "" });
 
-    ss << "\n";
-    DumpSectionHeader(ss, "ABI compatibility", "driver", "PSDB compiler");
-    DumpRow(ss, "Adapter family",
-            FormatStringField(payload, L"AbiSupport.AdapterFamily"),
-            FormatStringField(payload, L"CompilerIdentity.AdapterFamily"),
-            StringMismatchNote(payload, L"AbiSupport.AdapterFamily",
-                               L"CompilerIdentity.AdapterFamily", anyMismatch));
-    DumpRow(ss, "Compiler version",
-            FormatVersionField(payload, L"AbiSupport.CompilerVersion"),
-            FormatVersionField(payload, L"CompilerIdentity.CompilerVersion"));
+    DiagSection abi;
+    abi.title = "ABI compatibility";
+    abi.leftHeader = "driver";
+    abi.rightHeader = "PSDB compiler";
+    abi.rows.push_back({ "Adapter family",
+        FormatStringField(payload, L"AbiSupport.AdapterFamily"),
+        FormatStringField(payload, L"CompilerIdentity.AdapterFamily"),
+        StringMismatchNote(payload, L"AbiSupport.AdapterFamily",
+                           L"CompilerIdentity.AdapterFamily", anyMismatch) });
+    abi.rows.push_back({ "Compiler version",
+        FormatVersionField(payload, L"AbiSupport.CompilerVersion"),
+        FormatVersionField(payload, L"CompilerIdentity.CompilerVersion"), "" });
 
     auto minAbi = payload.GetInt(L"AbiSupport.MinimumABISupportVersion");
     auto maxAbi = payload.GetInt(L"AbiSupport.MaximumABISupportVersion");
@@ -538,45 +600,44 @@ bool DumpAsdInitPayload(std::ostringstream& ss, const TraceLoggingPayload& paylo
     std::string abiRange = (minAbi && maxAbi)
         ? "[" + FormatVersion(*minAbi) + ", " + FormatVersion(*maxAbi) + "]"
         : "(absent)";
-    const char* abiNote = nullptr;
+    std::string abiNote;
     if (abiVersion && minAbi && maxAbi && (*abiVersion < *minAbi || *abiVersion > *maxAbi)) {
         anyMismatch = true;
         abiNote = "out of range";
     }
-    DumpRow(ss, "ABI version", abiRange,
-            FormatVersionField(payload, L"CompilerIdentity.ABIVersion"), abiNote);
+    abi.rows.push_back({ "ABI version", abiRange,
+        FormatVersionField(payload, L"CompilerIdentity.ABIVersion"), abiNote });
 
-    ss << "\n  Application profile\n";
+    DiagSection profile;
+    profile.title = "Application profile";
     auto supportProfile = payload.GetInt(L"AbiSupport.ApplicationProfileVersion");
     auto identityProfile = payload.GetInt(L"ApplicationIdentity.ApplicationProfileVersion");
-    const char* profileNote = nullptr;
+    std::string profileNote;
     if (supportProfile && identityProfile && (*supportProfile >> 32) != (*identityProfile >> 32)) {
         anyMismatch = true;
         profileNote = "major version mismatch";
     }
-    DumpRow(ss, "Driver expects", FormatVersionField(payload, L"AbiSupport.ApplicationProfileVersion"));
-    DumpRow(ss, "PSDB resolved",
-            FormatVersionField(payload, L"ApplicationIdentity.ApplicationProfileVersion"),
-            std::string(), profileNote);
+    profile.rows.push_back({ "Driver expects",
+        FormatVersionField(payload, L"AbiSupport.ApplicationProfileVersion"), "", "" });
+    profile.rows.push_back({ "PSDB resolved",
+        FormatVersionField(payload, L"ApplicationIdentity.ApplicationProfileVersion"), "", profileNote });
 
-    ss << "\n  Sources\n";
+    DiagSection sources;
+    sources.title = "Sources";
     auto descSource = payload.GetInt(L"ApplicationDescSource");
     auto psdbSource = payload.GetInt(L"DefaultPsdbSource");
-    if (descSource) {
-        DumpRow(ss, "Application desc",
-                std::string(ApplicationDescSourceToString(static_cast<ApplicationDescSource>(*descSource)))
-                    + " (" + std::to_string(*descSource) + ")");
-    } else {
-        DumpRow(ss, "Application desc", "(not present, requires schemaVersion >= 3)");
-    }
-    if (psdbSource) {
-        DumpRow(ss, "Default PSDB",
-                std::string(DefaultPsdbSourceToString(static_cast<DefaultPsdbSource>(*psdbSource)))
-                    + " (" + std::to_string(*psdbSource) + ")");
-    } else {
-        DumpRow(ss, "Default PSDB", "(not present, requires schemaVersion >= 3)");
-    }
+    sources.rows.push_back({ "Application desc",
+        descSource
+            ? std::string(ApplicationDescSourceToString(static_cast<ApplicationDescSource>(*descSource)))
+                  + " (" + std::to_string(*descSource) + ")"
+            : std::string("(not present, requires schemaVersion >= 3)"), "", "" });
+    sources.rows.push_back({ "Default PSDB",
+        psdbSource
+            ? std::string(DefaultPsdbSourceToString(static_cast<DefaultPsdbSource>(*psdbSource)))
+                  + " (" + std::to_string(*psdbSource) + ")"
+            : std::string("(not present, requires schemaVersion >= 3)"), "", "" });
 
+    RenderSections(ss, { appMatch, abi, profile, sources });
     return anyMismatch;
 }
 
