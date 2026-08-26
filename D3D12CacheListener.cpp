@@ -431,62 +431,6 @@ static std::string FormatVersionField(const TraceLoggingPayload& payload, const 
     return FormatVersion(*value);
 }
 
-static void DumpField(std::ostringstream& ss, const char* label, const std::string& value) {
-    ss << "    " << std::left << std::setw(27) << label << ": " << value << "\n";
-    ss << std::right;
-}
-
-void DumpAsdInitPayload(std::ostringstream& ss, const TraceLoggingPayload& payload) {
-    auto schemaVersion = payload.GetInt(L"schemaVersion");
-    ss << "  --- ASDInit payload (schemaVersion ";
-    if (schemaVersion) ss << *schemaVersion; else ss << "unknown";
-    ss << ") ---\n";
-
-    ss << "  AbiSupport:\n";
-    DumpField(ss, "AdapterFamily", FormatStringField(payload, L"AbiSupport.AdapterFamily"));
-    DumpField(ss, "CompilerVersion", FormatVersionField(payload, L"AbiSupport.CompilerVersion"));
-    DumpField(ss, "MinimumABISupportVersion", FormatVersionField(payload, L"AbiSupport.MinimumABISupportVersion"));
-    DumpField(ss, "MaximumABISupportVersion", FormatVersionField(payload, L"AbiSupport.MaximumABISupportVersion"));
-    DumpField(ss, "ApplicationProfileVersion", FormatVersionField(payload, L"AbiSupport.ApplicationProfileVersion"));
-
-    ss << "  ApplicationDesc:\n";
-    DumpField(ss, "ExeFilename", FormatStringField(payload, L"ApplicationDesc.ExeFilename"));
-    DumpField(ss, "Name", FormatStringField(payload, L"ApplicationDesc.Name"));
-    DumpField(ss, "Version", FormatVersionField(payload, L"ApplicationDesc.Version"));
-    DumpField(ss, "EngineName", FormatStringField(payload, L"ApplicationDesc.EngineName"));
-    DumpField(ss, "EngineVersion", FormatVersionField(payload, L"ApplicationDesc.EngineVersion"));
-
-    ss << "  CompilerIdentity:\n";
-    DumpField(ss, "ABIVersion", FormatVersionField(payload, L"CompilerIdentity.ABIVersion"));
-    DumpField(ss, "CompilerVersion", FormatVersionField(payload, L"CompilerIdentity.CompilerVersion"));
-    DumpField(ss, "AdapterFamily", FormatStringField(payload, L"CompilerIdentity.AdapterFamily"));
-
-    ss << "  ApplicationIdentity:\n";
-    DumpField(ss, "ExeFilename", FormatStringField(payload, L"ApplicationIdentity.ExeFilename"));
-    DumpField(ss, "ApplicationName", FormatStringField(payload, L"ApplicationIdentity.ApplicationName"));
-    DumpField(ss, "EngineName", FormatStringField(payload, L"ApplicationIdentity.EngineName"));
-    DumpField(ss, "ApplicationVersion", FormatVersionField(payload, L"ApplicationIdentity.ApplicationVersion"));
-    DumpField(ss, "EngineVersion", FormatVersionField(payload, L"ApplicationIdentity.EngineVersion"));
-    DumpField(ss, "ApplicationProfileVersion", FormatVersionField(payload, L"ApplicationIdentity.ApplicationProfileVersion"));
-
-    auto descSource = payload.GetInt(L"ApplicationDescSource");
-    auto psdbSource = payload.GetInt(L"DefaultPsdbSource");
-    if (descSource) {
-        ss << "  ApplicationDescSource      : "
-           << ApplicationDescSourceToString(static_cast<ApplicationDescSource>(*descSource))
-           << " (" << *descSource << ")\n";
-    } else {
-        ss << "  ApplicationDescSource      : (not present, requires schemaVersion >= 3)\n";
-    }
-    if (psdbSource) {
-        ss << "  DefaultPsdbSource          : "
-           << DefaultPsdbSourceToString(static_cast<DefaultPsdbSource>(*psdbSource))
-           << " (" << *psdbSource << ")\n";
-    } else {
-        ss << "  DefaultPsdbSource          : (not present, requires schemaVersion >= 3)\n";
-    }
-}
-
 static bool EqualsIgnoringCase(const std::wstring& a, const std::wstring& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -495,56 +439,142 @@ static bool EqualsIgnoringCase(const std::wstring& a, const std::wstring& b) {
     return true;
 }
 
-// Reports a string mismatch, hinting when the two values differ only by case, which is a
-// common and easily-missed registration bug.
-static void CheckStringMismatch(std::ostringstream& ss, bool& anyMismatch,
-                                const TraceLoggingPayload& payload, const char* description,
-                                const wchar_t* keyA, const char* labelA,
-                                const wchar_t* keyB, const char* labelB) {
-    auto a = payload.GetString(keyA);
-    auto b = payload.GetString(keyB);
-    if (!a || !b) return;
-    if (*a == *b) return;
+// Column geometry for the two-column comparison layout.
+static const size_t kLabelWidth = 19;
+static const size_t kValueWidth = 26;
 
-    anyMismatch = true;
-    ss << "  [!] " << description << ": " << labelA << "=\"" << NarrowString(*a)
-       << "\" " << labelB << "=\"" << NarrowString(*b) << "\"";
-    if (EqualsIgnoringCase(*a, *b)) ss << " (differs only by case)";
-    ss << "\n";
+static std::string PadTo(const std::string& s, size_t width) {
+    if (s.size() >= width) return s + " ";
+    return s + std::string(width - s.size(), ' ');
 }
 
-// Applies the known identity rules and explains each failure. Returns false if no known rule
-// fired, which itself is signal that the runtime enforces a check this tool doesn't model.
-bool ReportIdentityMismatches(std::ostringstream& ss, const TraceLoggingPayload& payload) {
+static void DumpSectionHeader(std::ostringstream& ss, const char* title,
+                              const char* leftHeader, const char* rightHeader) {
+    ss << "  " << PadTo(title, kLabelWidth + 4) << PadTo(leftHeader, kValueWidth)
+       << rightHeader << "\n";
+}
+
+// Emits one row. Pass an empty right value for single-column rows; mismatchNote is appended as
+// an inline marker so the failure is called out where the values actually disagree.
+static void DumpRow(std::ostringstream& ss, const char* label, const std::string& left,
+                    const std::string& right = std::string(),
+                    const char* mismatchNote = nullptr) {
+    ss << "    " << PadTo(label, kLabelWidth) << ": ";
+    if (right.empty() && !mismatchNote) {
+        ss << left << "\n";
+        return;
+    }
+    if (right.empty()) {
+        ss << PadTo(left, kValueWidth) << "<-- " << mismatchNote << "\n";
+        return;
+    }
+    ss << PadTo(left, kValueWidth);
+    if (mismatchNote) {
+        ss << PadTo(right, kValueWidth) << "<-- " << mismatchNote << "\n";
+    } else {
+        ss << right << "\n";
+    }
+}
+
+// Returns the inline marker text for a mismatched string pair, or nullptr when the two agree
+// (or either is absent). Differing only by case is a common and easily-missed registration bug,
+// so it gets its own wording.
+static const char* StringMismatchNote(const TraceLoggingPayload& payload, const wchar_t* keyA,
+                                      const wchar_t* keyB, bool& anyMismatch) {
+    auto a = payload.GetString(keyA);
+    auto b = payload.GetString(keyB);
+    if (!a || !b || *a == *b) return nullptr;
+    anyMismatch = true;
+    return EqualsIgnoringCase(*a, *b) ? "mismatch (differs only by case)" : "mismatch";
+}
+
+// Prints the decoded ASDInit payload as three comparisons, which is how the identity check
+// actually reasons about it: does this PSDB describe this application, can this driver consume
+// what the PSDB compiler produced, and did the compiler resolve the profile the driver expects.
+// Returns true if any known identity rule failed.
+bool DumpAsdInitPayload(std::ostringstream& ss, const TraceLoggingPayload& payload) {
     bool anyMismatch = false;
 
-    CheckStringMismatch(ss, anyMismatch, payload, "Application name mismatch",
-                        L"ApplicationDesc.Name", "desc",
-                        L"ApplicationIdentity.ApplicationName", "identity");
-    CheckStringMismatch(ss, anyMismatch, payload, "Engine name mismatch",
-                        L"ApplicationDesc.EngineName", "desc",
-                        L"ApplicationIdentity.EngineName", "identity");
-    CheckStringMismatch(ss, anyMismatch, payload, "Adapter family mismatch",
-                        L"AbiSupport.AdapterFamily", "abiSupport",
-                        L"CompilerIdentity.AdapterFamily", "compilerIdentity");
+    auto schemaVersion = payload.GetInt(L"schemaVersion");
+    ss << "  --- ASDInit diagnostics (schemaVersion ";
+    if (schemaVersion) ss << *schemaVersion; else ss << "unknown";
+    ss << ") ---\n\n";
 
-    auto abiVersion = payload.GetInt(L"CompilerIdentity.ABIVersion");
+    DumpSectionHeader(ss, "Application match", "D3D sees now", "PSDB was built for");
+    DumpRow(ss, "Name",
+            FormatStringField(payload, L"ApplicationDesc.Name"),
+            FormatStringField(payload, L"ApplicationIdentity.ApplicationName"),
+            StringMismatchNote(payload, L"ApplicationDesc.Name",
+                               L"ApplicationIdentity.ApplicationName", anyMismatch));
+    DumpRow(ss, "Engine",
+            FormatStringField(payload, L"ApplicationDesc.EngineName"),
+            FormatStringField(payload, L"ApplicationIdentity.EngineName"),
+            StringMismatchNote(payload, L"ApplicationDesc.EngineName",
+                               L"ApplicationIdentity.EngineName", anyMismatch));
+    DumpRow(ss, "Version",
+            FormatVersionField(payload, L"ApplicationDesc.Version"),
+            FormatVersionField(payload, L"ApplicationIdentity.ApplicationVersion"));
+    DumpRow(ss, "Engine version",
+            FormatVersionField(payload, L"ApplicationDesc.EngineVersion"),
+            FormatVersionField(payload, L"ApplicationIdentity.EngineVersion"));
+    DumpRow(ss, "Executable",
+            FormatStringField(payload, L"ApplicationDesc.ExeFilename"),
+            FormatStringField(payload, L"ApplicationIdentity.ExeFilename"));
+
+    ss << "\n";
+    DumpSectionHeader(ss, "ABI compatibility", "driver", "PSDB compiler");
+    DumpRow(ss, "Adapter family",
+            FormatStringField(payload, L"AbiSupport.AdapterFamily"),
+            FormatStringField(payload, L"CompilerIdentity.AdapterFamily"),
+            StringMismatchNote(payload, L"AbiSupport.AdapterFamily",
+                               L"CompilerIdentity.AdapterFamily", anyMismatch));
+    DumpRow(ss, "Compiler version",
+            FormatVersionField(payload, L"AbiSupport.CompilerVersion"),
+            FormatVersionField(payload, L"CompilerIdentity.CompilerVersion"));
+
     auto minAbi = payload.GetInt(L"AbiSupport.MinimumABISupportVersion");
     auto maxAbi = payload.GetInt(L"AbiSupport.MaximumABISupportVersion");
+    auto abiVersion = payload.GetInt(L"CompilerIdentity.ABIVersion");
+    std::string abiRange = (minAbi && maxAbi)
+        ? "[" + FormatVersion(*minAbi) + ", " + FormatVersion(*maxAbi) + "]"
+        : "(absent)";
+    const char* abiNote = nullptr;
     if (abiVersion && minAbi && maxAbi && (*abiVersion < *minAbi || *abiVersion > *maxAbi)) {
         anyMismatch = true;
-        ss << "  [!] Compiler ABI version " << FormatVersion(*abiVersion)
-           << " outside supported range [" << FormatVersion(*minAbi) << ", "
-           << FormatVersion(*maxAbi) << "]\n";
+        abiNote = "out of range";
     }
+    DumpRow(ss, "ABI version", abiRange,
+            FormatVersionField(payload, L"CompilerIdentity.ABIVersion"), abiNote);
 
+    ss << "\n  Application profile\n";
     auto supportProfile = payload.GetInt(L"AbiSupport.ApplicationProfileVersion");
     auto identityProfile = payload.GetInt(L"ApplicationIdentity.ApplicationProfileVersion");
+    const char* profileNote = nullptr;
     if (supportProfile && identityProfile && (*supportProfile >> 32) != (*identityProfile >> 32)) {
         anyMismatch = true;
-        ss << "  [!] Application profile version major mismatch: abiSupport="
-           << FormatVersion(*supportProfile) << " identity=" << FormatVersion(*identityProfile)
-           << " (compared on the leading two components)\n";
+        profileNote = "major version mismatch";
+    }
+    DumpRow(ss, "Driver expects", FormatVersionField(payload, L"AbiSupport.ApplicationProfileVersion"));
+    DumpRow(ss, "PSDB resolved",
+            FormatVersionField(payload, L"ApplicationIdentity.ApplicationProfileVersion"),
+            std::string(), profileNote);
+
+    ss << "\n  Sources\n";
+    auto descSource = payload.GetInt(L"ApplicationDescSource");
+    auto psdbSource = payload.GetInt(L"DefaultPsdbSource");
+    if (descSource) {
+        DumpRow(ss, "Application desc",
+                std::string(ApplicationDescSourceToString(static_cast<ApplicationDescSource>(*descSource)))
+                    + " (" + std::to_string(*descSource) + ")");
+    } else {
+        DumpRow(ss, "Application desc", "(not present, requires schemaVersion >= 3)");
+    }
+    if (psdbSource) {
+        DumpRow(ss, "Default PSDB",
+                std::string(DefaultPsdbSourceToString(static_cast<DefaultPsdbSource>(*psdbSource)))
+                    + " (" + std::to_string(*psdbSource) + ")");
+    } else {
+        DumpRow(ss, "Default PSDB", "(not present, requires schemaVersion >= 3)");
     }
 
     return anyMismatch;
@@ -586,14 +616,12 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
 
             bool identityFailure = stepValue && step == AsdInitStep::IdentityCheck;
             if (parsed && (identityFailure || g_verbose)) {
-                DumpAsdInitPayload(ss, payload);
-            }
-            if (parsed && identityFailure) {
-                ss << "  --- Identity mismatches ---\n";
-                if (!ReportIdentityMismatches(ss, payload)) {
-                    ss << "  No mismatch detected by known rules; the runtime may enforce a check "
-                          "this tool does not model.\n";
+                bool anyMismatch = DumpAsdInitPayload(ss, payload);
+                if (identityFailure && !anyMismatch) {
+                    ss << "\n  No mismatch detected by known rules; the runtime may enforce a "
+                          "check this tool does not model.\n";
                 }
+                ss << "\n";
             }
 
             std::lock_guard<std::mutex> lock(console_mutex);
