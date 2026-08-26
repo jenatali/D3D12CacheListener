@@ -15,6 +15,10 @@
 #include <chrono>
 #include <tlhelp32.h>
 #include <csignal>
+#include <sstream>
+#include <map>
+#include <optional>
+#include <cwctype>
 
 // D3D12 Manifest Provider GUID: 5d8087dd-3a9b-4f56-90df-49196cdc4f11
 // D3D12 Tracelogging Provider GUID: 82fe78cc-ff52-4e2f-a7bb-5c90636d14ba
@@ -67,7 +71,23 @@ LARGE_INTEGER g_qpcFrequency;
 std::unordered_map<DWORD, ProcessStats> process_stats;
 std::unordered_set<DWORD> asdinit_pids;
 std::mutex stats_mutex;
+// Guards console writes so multi-line diagnostics from concurrent PIDs don't interleave.
+std::mutex console_mutex;
 std::atomic<bool> running{ true };
+std::atomic<bool> g_verbose{ false };
+
+// Retrieves the TRACE_EVENT_INFO for an event. Returns an empty vector on failure;
+// on success the returned buffer owns the storage that the pointer refers to.
+std::vector<BYTE> GetEventInfo(PEVENT_RECORD pEvent) {
+    ULONG bufferSize = 0;
+    if (TdhGetEventInformation(pEvent, 0, NULL, NULL, &bufferSize) != ERROR_INSUFFICIENT_BUFFER)
+        return {};
+    std::vector<BYTE> buffer(bufferSize);
+    auto eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
+    if (TdhGetEventInformation(pEvent, 0, NULL, eventInfo, &bufferSize) != ERROR_SUCCESS)
+        return {};
+    return buffer;
+}
 
 std::string GetExeNameFromPID(DWORD pid) {
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -85,6 +105,7 @@ std::string GetExeNameFromPID(DWORD pid) {
 }
 
 void LogProcessTimes(DWORD pid, const ProcessStats& ps) {
+    std::lock_guard<std::mutex> consoleLock(console_mutex);
     const std::string& exe = ps.exe_name;
     const char* asdMode = ps.has_psdb ? "ASD ON" : "ASD OFF";
 
@@ -126,6 +147,7 @@ std::atomic<bool> g_stopRequested{ false };
 // Print stats only if total_events for any event type changed since last print
 void PrintStats() {
     std::lock_guard<std::mutex> lock(stats_mutex);
+    std::lock_guard<std::mutex> consoleLock(console_mutex);
     for (auto& kv : process_stats) {
         DWORD pid = kv.first;
         ProcessStats& stats = kv.second;
@@ -150,15 +172,9 @@ void PrintStats() {
 
 void ParseManifestPayload(PEVENT_RECORD pEvent) {
     CacheStats stats = {};
-    ULONG status = ERROR_SUCCESS;
-    ULONG bufferSize = 0;
-    status = TdhGetEventInformation(pEvent, 0, NULL, NULL, &bufferSize);
-    if (status != ERROR_INSUFFICIENT_BUFFER) return;
-
-    std::vector<BYTE> buffer(bufferSize);
+    std::vector<BYTE> buffer = GetEventInfo(pEvent);
+    if (buffer.empty()) return;
     auto eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
-    status = TdhGetEventInformation(pEvent, 0, NULL, eventInfo, &bufferSize);
-    if (status != ERROR_SUCCESS) return;
 
     // Find the fields by name
     for (ULONG i = 0; i < eventInfo->TopLevelPropertyCount; ++i) {
@@ -167,7 +183,7 @@ void ParseManifestPayload(PEVENT_RECORD pEvent) {
         propDesc.ArrayIndex = ULONG_MAX;
         ULONG value = 0;
         ULONG valueSize = sizeof(value);
-        status = TdhGetProperty(pEvent, 0, NULL, 1, &propDesc, valueSize, (PBYTE)&value);
+        ULONG status = TdhGetProperty(pEvent, 0, NULL, 1, &propDesc, valueSize, (PBYTE)&value);
         if (status != ERROR_SUCCESS) continue;
 
         std::wstring propName((WCHAR*)((BYTE*)eventInfo + eventInfo->EventPropertyInfoArray[i].NameOffset));
@@ -208,17 +224,21 @@ enum class AsdInitStep : uint32_t
     IdentityCheck
 };
 
-TDHSTATUS GetAsdInitStep(PEVENT_RECORD pEvent, AsdInitStep& step) {
-    LPCWSTR szPropertyName = L"Step";
+enum class ApplicationDescSource : uint32_t
+{
+    None = 0,
+    PrecompiledDatabaseOverride = 1,
+    SetApplicationIdentity = 2,
+    ShaderCacheRegistration = 3,
+};
 
-    PROPERTY_DATA_DESCRIPTOR propDesc = {};
-    propDesc.PropertyName = reinterpret_cast<UINT_PTR>(szPropertyName);
-    propDesc.ArrayIndex = ULONG_MAX;
-
-    step = AsdInitStep::None;
-    ULONG valueSize = sizeof(step);
-    return TdhGetProperty(pEvent, 0, NULL, 1, &propDesc, valueSize, (PBYTE)&step);
-}
+enum class DefaultPsdbSource : uint32_t
+{
+    None = 0,
+    PrecompiledDatabaseOverride = 1,
+    PrecompiledDatabasePath = 2,
+    ShaderCacheRegistration = 3,
+};
 
 LPCSTR AsdInitStepToString(AsdInitStep step)
 { 
@@ -234,15 +254,307 @@ LPCSTR AsdInitStepToString(AsdInitStep step)
     return "Step Unknown";
 }
 
+LPCSTR ApplicationDescSourceToString(ApplicationDescSource source)
+{
+    switch (source)
+    {
+    case ApplicationDescSource::None: return "None";
+    case ApplicationDescSource::PrecompiledDatabaseOverride: return "PrecompiledDatabaseOverride";
+    case ApplicationDescSource::SetApplicationIdentity: return "SetApplicationIdentity";
+    case ApplicationDescSource::ShaderCacheRegistration: return "ShaderCacheRegistration";
+    };
+
+    return "Unknown";
+}
+
+LPCSTR DefaultPsdbSourceToString(DefaultPsdbSource source)
+{
+    switch (source)
+    {
+    case DefaultPsdbSource::None: return "None";
+    case DefaultPsdbSource::PrecompiledDatabaseOverride: return "PrecompiledDatabaseOverride";
+    case DefaultPsdbSource::PrecompiledDatabasePath: return "PrecompiledDatabasePath";
+    case DefaultPsdbSource::ShaderCacheRegistration: return "ShaderCacheRegistration";
+    };
+
+    return "Unknown";
+}
+
+// A parsed TraceLogging payload. Fields are keyed by "StructName.FieldName" for members of a
+// TraceLoggingStruct, or by the bare field name for top-level fields. Keying by the qualified
+// name matters here: ASDInit repeats ExeFilename, EngineName, CompilerVersion and AdapterFamily
+// across multiple structs.
+struct TraceLoggingPayload {
+    std::map<std::wstring, std::wstring> strings;
+    std::map<std::wstring, uint64_t> integers;
+
+    std::optional<std::wstring> GetString(const wchar_t* key) const {
+        auto it = strings.find(key);
+        if (it == strings.end()) return std::nullopt;
+        return it->second;
+    }
+    std::optional<uint64_t> GetInt(const wchar_t* key) const {
+        auto it = integers.find(key);
+        if (it == integers.end()) return std::nullopt;
+        return it->second;
+    }
+};
+
+// Reads a single (possibly struct-nested) property into the payload maps.
+// structName is null for top-level fields.
+static void ReadProperty(PEVENT_RECORD pEvent, TRACE_EVENT_INFO* eventInfo,
+                         const EVENT_PROPERTY_INFO& propInfo, const wchar_t* structName,
+                         TraceLoggingPayload& out) {
+    auto* name = (const wchar_t*)((BYTE*)eventInfo + propInfo.NameOffset);
+
+    PROPERTY_DATA_DESCRIPTOR desc[2] = {};
+    ULONG descCount = 0;
+    if (structName) {
+        desc[0].PropertyName = reinterpret_cast<ULONGLONG>(structName);
+        desc[0].ArrayIndex = 0;
+        desc[1].PropertyName = reinterpret_cast<ULONGLONG>(name);
+        desc[1].ArrayIndex = ULONG_MAX;
+        descCount = 2;
+    } else {
+        desc[0].PropertyName = reinterpret_cast<ULONGLONG>(name);
+        desc[0].ArrayIndex = ULONG_MAX;
+        descCount = 1;
+    }
+
+    std::wstring key;
+    if (structName) {
+        key = structName;
+        key += L'.';
+    }
+    key += name;
+
+    switch (propInfo.nonStructType.InType) {
+    case TDH_INTYPE_UNICODESTRING: {
+        ULONG size = 0;
+        if (TdhGetPropertySize(pEvent, 0, NULL, descCount, desc, &size) != ERROR_SUCCESS || size == 0)
+            return;
+        std::vector<BYTE> buf(size + sizeof(wchar_t), 0);
+        if (TdhGetProperty(pEvent, 0, NULL, descCount, desc, size, buf.data()) != ERROR_SUCCESS)
+            return;
+        out.strings[key] = std::wstring(reinterpret_cast<const wchar_t*>(buf.data()));
+        break;
+    }
+    case TDH_INTYPE_INT8:
+    case TDH_INTYPE_UINT8:
+    case TDH_INTYPE_BOOLEAN: {
+        uint8_t v = 0;
+        if (TdhGetProperty(pEvent, 0, NULL, descCount, desc, sizeof(v), (PBYTE)&v) == ERROR_SUCCESS)
+            out.integers[key] = v;
+        break;
+    }
+    case TDH_INTYPE_INT16:
+    case TDH_INTYPE_UINT16: {
+        uint16_t v = 0;
+        if (TdhGetProperty(pEvent, 0, NULL, descCount, desc, sizeof(v), (PBYTE)&v) == ERROR_SUCCESS)
+            out.integers[key] = v;
+        break;
+    }
+    case TDH_INTYPE_INT32:
+    case TDH_INTYPE_UINT32:
+    case TDH_INTYPE_HEXINT32: {
+        uint32_t v = 0;
+        if (TdhGetProperty(pEvent, 0, NULL, descCount, desc, sizeof(v), (PBYTE)&v) == ERROR_SUCCESS)
+            out.integers[key] = v;
+        break;
+    }
+    case TDH_INTYPE_INT64:
+    case TDH_INTYPE_UINT64:
+    case TDH_INTYPE_HEXINT64: {
+        uint64_t v = 0;
+        if (TdhGetProperty(pEvent, 0, NULL, descCount, desc, sizeof(v), (PBYTE)&v) == ERROR_SUCCESS)
+            out.integers[key] = v;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// Walks a TraceLogging event payload, descending one level into TraceLoggingStructs.
+bool ParseTraceLoggingPayload(PEVENT_RECORD pEvent, TraceLoggingPayload& out) {
+    std::vector<BYTE> buffer = GetEventInfo(pEvent);
+    if (buffer.empty()) return false;
+    auto eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
+
+    for (ULONG i = 0; i < eventInfo->TopLevelPropertyCount; ++i) {
+        const EVENT_PROPERTY_INFO& propInfo = eventInfo->EventPropertyInfoArray[i];
+        if (propInfo.Flags & PropertyStruct) {
+            auto* structName = (const wchar_t*)((BYTE*)eventInfo + propInfo.NameOffset);
+            ULONG start = propInfo.structType.StructStartIndex;
+            ULONG count = propInfo.structType.NumOfStructMembers;
+            for (ULONG j = 0; j < count; ++j) {
+                ULONG memberIndex = start + j;
+                if (memberIndex >= eventInfo->PropertyCount) break;
+                ReadProperty(pEvent, eventInfo, eventInfo->EventPropertyInfoArray[memberIndex],
+                             structName, out);
+            }
+        } else {
+            ReadProperty(pEvent, eventInfo, propInfo, nullptr, out);
+        }
+    }
+    return true;
+}
+
+// Version-shaped uint64s pack four 16-bit components; render them as decimal a.b.c.d.
+std::string FormatVersion(uint64_t version) {
+    std::ostringstream ss;
+    ss << ((version >> 48) & 0xffff) << '.'
+       << ((version >> 32) & 0xffff) << '.'
+       << ((version >> 16) & 0xffff) << '.'
+       << (version & 0xffff);
+    return ss.str();
+}
+
+std::string NarrowString(const std::wstring& wide) {
+    if (wide.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), (int)wide.size(), result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+static std::string FormatStringField(const TraceLoggingPayload& payload, const wchar_t* key) {
+    auto value = payload.GetString(key);
+    if (!value) return "(absent)";
+    return "\"" + NarrowString(*value) + "\"";
+}
+
+static std::string FormatVersionField(const TraceLoggingPayload& payload, const wchar_t* key) {
+    auto value = payload.GetInt(key);
+    if (!value) return "(absent)";
+    return FormatVersion(*value);
+}
+
+static void DumpField(std::ostringstream& ss, const char* label, const std::string& value) {
+    ss << "    " << std::left << std::setw(27) << label << ": " << value << "\n";
+    ss << std::right;
+}
+
+void DumpAsdInitPayload(std::ostringstream& ss, const TraceLoggingPayload& payload) {
+    auto schemaVersion = payload.GetInt(L"schemaVersion");
+    ss << "  --- ASDInit payload (schemaVersion ";
+    if (schemaVersion) ss << *schemaVersion; else ss << "unknown";
+    ss << ") ---\n";
+
+    ss << "  AbiSupport:\n";
+    DumpField(ss, "AdapterFamily", FormatStringField(payload, L"AbiSupport.AdapterFamily"));
+    DumpField(ss, "CompilerVersion", FormatVersionField(payload, L"AbiSupport.CompilerVersion"));
+    DumpField(ss, "MinimumABISupportVersion", FormatVersionField(payload, L"AbiSupport.MinimumABISupportVersion"));
+    DumpField(ss, "MaximumABISupportVersion", FormatVersionField(payload, L"AbiSupport.MaximumABISupportVersion"));
+    DumpField(ss, "ApplicationProfileVersion", FormatVersionField(payload, L"AbiSupport.ApplicationProfileVersion"));
+
+    ss << "  ApplicationDesc:\n";
+    DumpField(ss, "ExeFilename", FormatStringField(payload, L"ApplicationDesc.ExeFilename"));
+    DumpField(ss, "Name", FormatStringField(payload, L"ApplicationDesc.Name"));
+    DumpField(ss, "Version", FormatVersionField(payload, L"ApplicationDesc.Version"));
+    DumpField(ss, "EngineName", FormatStringField(payload, L"ApplicationDesc.EngineName"));
+    DumpField(ss, "EngineVersion", FormatVersionField(payload, L"ApplicationDesc.EngineVersion"));
+
+    ss << "  CompilerIdentity:\n";
+    DumpField(ss, "ABIVersion", FormatVersionField(payload, L"CompilerIdentity.ABIVersion"));
+    DumpField(ss, "CompilerVersion", FormatVersionField(payload, L"CompilerIdentity.CompilerVersion"));
+    DumpField(ss, "AdapterFamily", FormatStringField(payload, L"CompilerIdentity.AdapterFamily"));
+
+    ss << "  ApplicationIdentity:\n";
+    DumpField(ss, "ExeFilename", FormatStringField(payload, L"ApplicationIdentity.ExeFilename"));
+    DumpField(ss, "ApplicationName", FormatStringField(payload, L"ApplicationIdentity.ApplicationName"));
+    DumpField(ss, "EngineName", FormatStringField(payload, L"ApplicationIdentity.EngineName"));
+    DumpField(ss, "ApplicationVersion", FormatVersionField(payload, L"ApplicationIdentity.ApplicationVersion"));
+    DumpField(ss, "EngineVersion", FormatVersionField(payload, L"ApplicationIdentity.EngineVersion"));
+    DumpField(ss, "ApplicationProfileVersion", FormatVersionField(payload, L"ApplicationIdentity.ApplicationProfileVersion"));
+
+    auto descSource = payload.GetInt(L"ApplicationDescSource");
+    auto psdbSource = payload.GetInt(L"DefaultPsdbSource");
+    if (descSource) {
+        ss << "  ApplicationDescSource      : "
+           << ApplicationDescSourceToString(static_cast<ApplicationDescSource>(*descSource))
+           << " (" << *descSource << ")\n";
+    } else {
+        ss << "  ApplicationDescSource      : (not present, requires schemaVersion >= 3)\n";
+    }
+    if (psdbSource) {
+        ss << "  DefaultPsdbSource          : "
+           << DefaultPsdbSourceToString(static_cast<DefaultPsdbSource>(*psdbSource))
+           << " (" << *psdbSource << ")\n";
+    } else {
+        ss << "  DefaultPsdbSource          : (not present, requires schemaVersion >= 3)\n";
+    }
+}
+
+static bool EqualsIgnoringCase(const std::wstring& a, const std::wstring& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (towlower(a[i]) != towlower(b[i])) return false;
+    }
+    return true;
+}
+
+// Reports a string mismatch, hinting when the two values differ only by case, which is a
+// common and easily-missed registration bug.
+static void CheckStringMismatch(std::ostringstream& ss, bool& anyMismatch,
+                                const TraceLoggingPayload& payload, const char* description,
+                                const wchar_t* keyA, const char* labelA,
+                                const wchar_t* keyB, const char* labelB) {
+    auto a = payload.GetString(keyA);
+    auto b = payload.GetString(keyB);
+    if (!a || !b) return;
+    if (*a == *b) return;
+
+    anyMismatch = true;
+    ss << "  [!] " << description << ": " << labelA << "=\"" << NarrowString(*a)
+       << "\" " << labelB << "=\"" << NarrowString(*b) << "\"";
+    if (EqualsIgnoringCase(*a, *b)) ss << " (differs only by case)";
+    ss << "\n";
+}
+
+// Applies the known identity rules and explains each failure. Returns false if no known rule
+// fired, which itself is signal that the runtime enforces a check this tool doesn't model.
+bool ReportIdentityMismatches(std::ostringstream& ss, const TraceLoggingPayload& payload) {
+    bool anyMismatch = false;
+
+    CheckStringMismatch(ss, anyMismatch, payload, "Application name mismatch",
+                        L"ApplicationDesc.Name", "desc",
+                        L"ApplicationIdentity.ApplicationName", "identity");
+    CheckStringMismatch(ss, anyMismatch, payload, "Engine name mismatch",
+                        L"ApplicationDesc.EngineName", "desc",
+                        L"ApplicationIdentity.EngineName", "identity");
+    CheckStringMismatch(ss, anyMismatch, payload, "Adapter family mismatch",
+                        L"AbiSupport.AdapterFamily", "abiSupport",
+                        L"CompilerIdentity.AdapterFamily", "compilerIdentity");
+
+    auto abiVersion = payload.GetInt(L"CompilerIdentity.ABIVersion");
+    auto minAbi = payload.GetInt(L"AbiSupport.MinimumABISupportVersion");
+    auto maxAbi = payload.GetInt(L"AbiSupport.MaximumABISupportVersion");
+    if (abiVersion && minAbi && maxAbi && (*abiVersion < *minAbi || *abiVersion > *maxAbi)) {
+        anyMismatch = true;
+        ss << "  [!] Compiler ABI version " << FormatVersion(*abiVersion)
+           << " outside supported range [" << FormatVersion(*minAbi) << ", "
+           << FormatVersion(*maxAbi) << "]\n";
+    }
+
+    auto supportProfile = payload.GetInt(L"AbiSupport.ApplicationProfileVersion");
+    auto identityProfile = payload.GetInt(L"ApplicationIdentity.ApplicationProfileVersion");
+    if (supportProfile && identityProfile && (*supportProfile >> 32) != (*identityProfile >> 32)) {
+        anyMismatch = true;
+        ss << "  [!] Application profile version major mismatch: abiSupport="
+           << FormatVersion(*supportProfile) << " identity=" << FormatVersion(*identityProfile)
+           << " (compared on the leading two components)\n";
+    }
+
+    return anyMismatch;
+}
+
 // Helper to get TraceLogging event name
 std::wstring GetTraceLoggingEventName(PEVENT_RECORD pEvent) {
-    ULONG bufferSize = 0;
-    ULONG status = TdhGetEventInformation(pEvent, 0, NULL, NULL, &bufferSize);
-    if (status != ERROR_INSUFFICIENT_BUFFER) return L"";
-    std::vector<BYTE> buffer(bufferSize);
+    std::vector<BYTE> buffer = GetEventInfo(pEvent);
+    if (buffer.empty()) return L"";
     auto eventInfo = reinterpret_cast<TRACE_EVENT_INFO*>(buffer.data());
-    status = TdhGetEventInformation(pEvent, 0, NULL, eventInfo, &bufferSize);
-    if (status != ERROR_SUCCESS) return L"";
     if (eventInfo->EventNameOffset == 0) return L"";
     return std::wstring((WCHAR*)((BYTE*)eventInfo + eventInfo->EventNameOffset));
 }
@@ -252,9 +564,11 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
         std::wstring eventName = GetTraceLoggingEventName(pEvent);
         if (eventName == L"ASDInit") {
             DWORD pid = pEvent->EventHeader.ProcessId;
-            AsdInitStep step = AsdInitStep::None;
-            auto status = GetAsdInitStep(pEvent, step);
-            bool hasPsdb = (status == ERROR_SUCCESS) && step == AsdInitStep::Success;
+            TraceLoggingPayload payload;
+            bool parsed = ParseTraceLoggingPayload(pEvent, payload);
+            auto stepValue = parsed ? payload.GetInt(L"Step") : std::nullopt;
+            AsdInitStep step = stepValue ? static_cast<AsdInitStep>(*stepValue) : AsdInitStep::None;
+            bool hasPsdb = stepValue.has_value() && step == AsdInitStep::Success;
             {
                 std::lock_guard<std::mutex> lock(stats_mutex);
                 auto res = process_stats.emplace(pid, ProcessStats{});
@@ -264,9 +578,26 @@ void WINAPI EventRecordCallback(PEVENT_RECORD pEvent) {
                 asdinit_pids.insert(pid);
             }
             auto hasDefaultPsdb = hasPsdb ? "true" : "false";
-            auto stepString = (status == ERROR_SUCCESS) ? AsdInitStepToString(step) : "Error Parsing Event";
+            auto stepString = stepValue ? AsdInitStepToString(step) : "Error Parsing Event";
 
-            std::cout << "ASDInit event seen for PID " << pid << ", HasDefaultPsdb: " << hasDefaultPsdb << ", Step: " << stepString << "\n";
+            std::ostringstream ss;
+            ss << "ASDInit event seen for PID " << pid << ", HasDefaultPsdb: " << hasDefaultPsdb
+               << ", Step: " << stepString << "\n";
+
+            bool identityFailure = stepValue && step == AsdInitStep::IdentityCheck;
+            if (parsed && (identityFailure || g_verbose)) {
+                DumpAsdInitPayload(ss, payload);
+            }
+            if (parsed && identityFailure) {
+                ss << "  --- Identity mismatches ---\n";
+                if (!ReportIdentityMismatches(ss, payload)) {
+                    ss << "  No mismatch detected by known rules; the runtime may enforce a check "
+                          "this tool does not model.\n";
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << ss.str() << std::flush;
         }
     } else if (IsEqualGUID(pEvent->EventHeader.ProviderId, D3D12_MANIFEST_PROVIDER)) {
         DWORD pid = pEvent->EventHeader.ProcessId;
@@ -387,7 +718,29 @@ void StopExistingSession(const wchar_t* sessionName) {
     free(props);
 }
 
-int main() {
+void PrintUsage(const char* exeName) {
+    std::cout << "Usage: " << exeName << " [-v|--verbose] [-h|--help]\n"
+              << "  -v, --verbose   Dump the full ASDInit payload for every ASDInit event,\n"
+              << "                  not just when the identity check fails.\n"
+              << "  -h, --help      Show this help text.\n";
+}
+
+int main(int argc, char** argv) {
+    const char* exeName = (argc > 0 && argv[0]) ? argv[0] : "D3D12CacheListener";
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-v" || arg == "--verbose") {
+            g_verbose = true;
+        } else if (arg == "-h" || arg == "--help") {
+            PrintUsage(exeName);
+            return 0;
+        } else {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            PrintUsage(exeName);
+            return 1;
+        }
+    }
+
     TRACEHANDLE sessionHandle = 0;
     TRACEHANDLE traceHandle = 0;
     EVENT_TRACE_PROPERTIES* props = nullptr;
